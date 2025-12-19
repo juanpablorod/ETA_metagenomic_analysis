@@ -1,0 +1,651 @@
+---
+title: "ASPIRE-ICU_metagenomics"
+author: "JPRR"
+date: "2025-12-19"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(vegan)
+library(tidyverse)
+library(ggsignif)
+library(RColorBrewer)
+library(gridExtra)
+library(grid)
+library(devtools)
+library(patchwork)
+library(ggplot2)
+library(dplyr)
+library(viridis)
+library(cowplot)
+library(reshape2)
+library(lawstat)
+library(ggh4x)
+library(labdsv)
+library(cluster)
+library(dendextend)
+library(MASS)
+library(phyloseq)
+library(corrplot)
+library(ComplexHeatmap)
+library(circlize)
+library(colorspace)
+library(GetoptLong)
+library(gtsummary)
+library(ANCOMBC)
+library(lmerTest)
+library(decontam)
+
+```
+
+```{r data upload}
+
+species_reads <- data.matrix(read.csv("~/species_reads.csv", header = TRUE, row.names = 1))
+
+metadata <- read.csv("~/Sample_information.csv", header = TRUE, row.names = 1)
+
+#Merge sample metadata and reads
+
+species_reads_merged <- merge(metadata, species_reads, by = "row.names", all =TRUE)
+rownames(species_reads_merged) = species_reads_merged$Row.names
+species_reads_merged = species_reads_merged[2:length(species_reads_merged)]
+
+#Clinical data
+
+ASPIRE_cross_clinical_data <- read.csv("~/ASPIRE-ICU_cross_sectional_all_data.csv", header = TRUE, row.names = 1)
+ASPIRE_selection[,97:109] <- lapply(ASPIRE_selection[,97:109], factor)
+
+```
+
+```{r decontam}
+
+species_reads_cont <- isContaminant(species_reads, neg = species_reads_merged$Sample_control, batch = species_reads_merged$Extraction_date)
+
+```
+
+```{r remove cont}
+
+transposed_species_reads <- data.matrix(t(species_reads))
+species_reads_cont[7398,6] = FALSE
+species_reads_cont[5133,6] = TRUE
+species_reads_cont[6860,6] = TRUE
+species_reads_cont_merged <- merge(species_reads_cont, transposed_species_reads, by = "row.names", all = TRUE)
+rownames(species_reads_cont_merged) = species_reads_cont_merged$Row.names
+species_reads_cont_merged = species_reads_cont_merged[2:length(species_reads_cont_merged)]
+species_reads_cont_removed <- species_reads_cont_merged[species_reads_cont_merged$contaminant == FALSE,]
+species_reads_cont_removed <- species_reads_cont_removed[7:length(species_reads_cont_removed)]
+write.csv(species_reads_cont_removed, "~/species_reads_cont_removed.csv")
+
+```
+
+```{r normalization}
+
+species = otu_table(ASPIRE_species, taxa_are_rows = FALSE)
+resample_species = rarefy_even_depth(species, replace = TRUE, rngseed = 711)
+ASPIRE_species_resampled = as.data.frame(resample_species)
+
+```
+
+```{r calculate alpha diversity}
+
+species_shannon_resampled <- diversity(ASPIRE_species_resampled, index = "shannon")
+
+ASPIRE_selection <- merge(ASPIRE_selection, species_shannon_resampled, by = "row.names", all =TRUE)
+    rownames(ASPIRE_selection) = ASPIRE_selection$Row.names
+ASPIRE_selection = ASPIRE_selection[2:length(ASPIRE_selection)]
+
+```
+
+```{r calculate beta diversity}
+
+species_betabray_resampled <- vegdist(ASPIRE_species_resampled, method = "bray")
+
+```
+
+```{r chisq_loops}
+
+df_chisq = data.frame()
+for (y in c(8:14,16:18,56,59:71,73:82,95,96,98:111)) {
+  row <- ASPIRE_selection[,y]
+  for (x in c(8:14,16:18,56,59:71,73:82,95,96,98:111)) {
+    col <- ASPIRE_selection[,x]
+    df_chisq = rbind(df_chisq, c(print(colnames(ASPIRE_selection[y])), print(colnames(ASPIRE_selection[x])), print(chisq.test(t(table(col, row, exclude = "")))$p.value)))
+    }
+  }
+colnames(df_chisq) <- c("Variable1", "Variable2", "pvalue")
+
+```
+
+```{r normality}
+
+df_shapiro = data.frame()
+
+for (x in c(5,7,23:45,57,58,83:93,97,112:147,149:185)) {
+    col <- ASPIRE_selection[,x]
+    df_shapiro = rbind(df_shapiro, c(print(colnames(ASPIRE_selection[x])), print(shapiro.test(col)$p.value)))
+    }
+colnames(df_shapiro) <- c("Variable", "pvalue")
+
+```
+
+```{r kruskal_test_numeric}
+
+df_kruskal = data.frame()
+summary_kruskal = list()
+for (y in c(8:14,16:18,56,59:71,73:82,95,96,98:111)) {
+  row <- ASPIRE_selection[,y]
+  for (x in c(5,7,23:45,57,58,83:93,97,112:147,149:185)) {
+    col <- ASPIRE_selection[,x]
+    df_kruskal = rbind(df_kruskal, c(print(colnames(ASPIRE_selection[y])), print(colnames(ASPIRE_selection[x])), print(kruskal.test(col ~ row, ASPIRE_selection)$p.value)))
+    summary_kruskal[[paste(colnames(ASPIRE_selection[y]),colnames(ASPIRE_selection[x]))]] = print(summarise(ASPIRE_selection, .by = colnames(ASPIRE_selection[y]), x = mean(.data[[colnames(ASPIRE_selection[x])]])))
+    }
+  }
+colnames(df_kruskal) <- c("Categorical variable", "Numeric variable", "pvalue")
+lapply(summary_kruskal, function(x) write.table(data.frame(x), 'Summary_mean_numeric_vs_categorical.csv', append= T, sep=','))
+
+```
+
+```{r kendall_cortest_numeric}
+
+df_kendall = data.frame()
+for (y in c(5,7,23:45,57,58,83:93,97,112:147,149:185)) {
+  row <- ASPIRE_selection[,y]
+  for (x in c(5,7,23:45,57,58,83:93,97,112:147,149:185)) {
+    col <- ASPIRE_selection[,x]
+    df_kendall = rbind(df_kendall, c(print(colnames(ASPIRE_selection[y])), print(colnames(ASPIRE_selection[x])), print(cor.test(row, col, method = "kendall")$p.value), print(cor.test(row, col, method = "kendall")$estimate)))
+    }
+  }
+colnames(df_kendall) <- c("Variable 1", "Variable 2", "pvalue", "Correlation coefficient")
+
+```
+
+```{r correlation matrices species AMR}
+
+species_species <- read.csv("~/species_vs_species.csv", header = TRUE, row.names = 1, check.names = FALSE)
+RGPC_species <- read.csv("~/RGPC_vs_species.csv", header = TRUE, row.names = 1, check.names = FALSE)
+intake_RGPC <- read.csv("~/intake_vs_RGPC.csv", header = TRUE, row.names = 1, check.names = FALSE)
+intake_mumame <- read.csv("~/intake_vs_mumame.csv", header = TRUE, row.names = 1, check.names = FALSE)
+
+heatmap_sp_sp <- Heatmap(as.matrix(species_species), col = colorRamp2(c(-1,0,1), c("blue", "white", "red")), cluster_rows = FALSE, cluster_columns = FALSE, row_names_side = "left", name = "Kendall correlation")
+
+heatmap_rgpc_sp <- Heatmap(as.matrix(RGPC_species), col = colorRamp2(c(-1,0,1), c("blue", "white", "red")), cluster_rows = FALSE, cluster_columns = FALSE, row_names_side = "left", name = "Kendall correlation")
+
+heatmap_int_rgpc <- Heatmap(as.matrix(intake_RGPC), col = colorRamp2(c(-0.5,0,3), c("blue", "white", "red")), cluster_rows = FALSE, cluster_columns = FALSE, row_names_side = "left", name = "Change in RGPC")
+
+heatmap_int_mum <- Heatmap(as.matrix(intake_mumame), col = colorRamp2(c(-0.5,0,0.5), c("blue", "white", "red")), cluster_rows = FALSE, cluster_columns = FALSE, row_names_side = "left", name = "Change in % mutations")
+
+```
+
+```{r clinical data table}
+
+ASPIRE_selection %>%
+  select(Gender, BMI, Age, Area, Country, Pneumonia, `Pneumonia aetiology`, Colonization, `Dominant genus`, `Myocardial infarction`, `Heart failure`, `Perivascular disease`, `Cerebrovascular disease`, Dementia, COPD, `Connective tissue disease`, `Peptic ulcer`, `Renal insufficiency`, `Mild liver disease`, `Severe liver disease`, Diabetes, Hemiplegia, Lymphoma, Tumor, `Metastasis of solid tumor`, AIDS, Immunodepression, Reason, `Type of surgery`, Origin, `Prior antibiotic intake`, `Total hospitalization length`, `Total ICU stay`, `Total mechanical ventilation length`, `Total antibiotic treatment length`, `Days to pneumonia`, Tracheostomy, APACHE, Destination, `Day 90 status`) %>%
+  tbl_summary(by = Pneumonia, missing = "no") %>%
+  add_p() %>%
+  add_n() %>%
+  add_overall() %>%
+  bold_labels() %>%
+  as_gt() %>%
+  gt::gtsave("clinical_data_table.docx")
+
+ASPIRE_selection %>%
+  select(Gender, BMI, Age, Area, Country, Pneumonia, `Pneumonia aetiology`, Colonization, `Dominant genus`, `Myocardial infarction`, `Heart failure`, `Perivascular disease`, `Cerebrovascular disease`, Dementia, COPD, `Connective tissue disease`, `Peptic ulcer`, `Renal insufficiency`, `Mild liver disease`, `Severe liver disease`, Diabetes, Hemiplegia, Lymphoma, Tumor, `Metastasis of solid tumor`, AIDS, Immunodepression, Reason, `Type of surgery`, Origin, `Prior antibiotic intake`, `Total hospitalization length`, `Total ICU stay`, `Total mechanical ventilation length`, `Total antibiotic treatment length`, `Days to pneumonia`, Tracheostomy, APACHE, Destination, `Day 90 status`) %>%
+  tbl_summary(by = Area, missing = "no") %>%
+  add_p() %>%
+  add_n() %>%
+  add_overall() %>%
+  bold_labels() %>%
+  as_gt() %>%
+  gt::gtsave("clinical_data_table_region.docx")
+
+```
+
+```{r diversity and RGPC models}
+
+#Diversity
+
+mixed_shannon <- lmer(log(Shannon_species) ~ Region + Pneumonia + Colonization + Pn_aetiology + Dom + Ab_prev_adm + Ab_prev_sample + Antianaerobic + Gender + BMI + Age + apache_II_final + Tracheo + Origin + MV_days + (1 | Site), ASPIRE_species_metadata)
+summary(mixed_shannon)
+anova(mixed_shannon, test = "Chisq")
+
+#RGPC
+
+mixed_RGPC <- lmer(log(RGPC) ~ Region + Pneumonia + Colonization + Pn_aetiology + Dom + Ab_prev_adm + Ab_prev_sample + Antianaerobic + Gender + BMI + Age + apache_II_final + Tracheo + Origin + MV_days + (1 | Site), ASPIRE_species_metadata)
+summary(mixed_RGPC)
+anova(mixed_RGPC, test = "Chisq")
+
+```
+
+```{r pcoa resampled bray}
+
+pcoa_species_bray_resampled <- cmdscale(species_betabray_resampled, k = 2, eig = T)
+pcoa_species_bray_resampled_plotting <- as.data.frame(pcoa_species_bray_resampled$points)
+colnames(pcoa_species_bray_resampled_plotting) <- c("axis_1", "axis_2")
+pcoa_species_bray_resampled_plotting$Pneumonia <- ASPIRE_species_metadata$Pneumonia
+pcoa_species_bray_resampled_plotting$Region <- ASPIRE_species_metadata$Region
+pcoa_species_bray_resampled_plotting$Dom <- ASPIRE_species_metadata$Dom
+pcoa_species_bray_resampled$eig[1]/(sum(pcoa_species_bray_resampled$eig))
+pcoa_species_bray_resampled$eig[2]/(sum(pcoa_species_bray_resampled$eig))
+
+pcoa_species_bray_pn <- ggplot(pcoa_species_bray_resampled_plotting, aes(x = axis_1, y = axis_2, colour = Pneumonia)) +
+  geom_point(size = 3) +
+  scale_color_manual(values = c("#E69F00", "#56B4E9")) +
+  theme_bw() + 
+  xlab("PCoA 1 (17.5%)") +
+  ylab("PCoA 2 (15.0%)") +
+  stat_ellipse() +
+  labs(tag = "A") +
+  theme(text = element_text(size=20, face = "bold"))
+pcoa_species_bray_pn
+
+pcoa_species_bray_reg <- ggplot(pcoa_species_bray_resampled_plotting, aes(x = axis_1, y = axis_2, colour = Region)) +
+  geom_point(size = 3) +
+  scale_color_manual(values = c("#009E73", "#CC79A7")) +
+  theme_bw() + 
+  xlab("PCoA 1 (17.5%)") +
+  ylab("PCoA 2 (15.0%)") +
+  stat_ellipse() +
+  labs(tag = "B") +
+  theme(text = element_text(size=20, face = "bold"))
+pcoa_species_bray_reg
+
+pcoa_species_bray_dom <- ggplot(pcoa_species_bray_resampled_plotting, aes(x = axis_1, y = axis_2, colour = Dom)) +
+  geom_point(size = 3) +
+  theme_bw() + 
+  xlab("PCoA 1 (17.5%)") +
+  ylab("PCoA 2 (15.0%)") +
+  stat_ellipse() +
+  guides(color = guide_legend(title = "Dominant genus", title.position = "top", title.hjust = 0.5), size = "none") +
+  labs(tag = "C") +
+  theme(text = element_text(size=20, face = "bold.italic"))
+pcoa_species_bray_dom
+
+```
+
+```{r betadisper bray}
+
+permutest(betadisper(species_betabray_resampled, ASPIRE_species_metadata$Pneumonia))
+TukeyHSD(betadisper(species_betabray_resampled, ASPIRE_species_metadata$Pneumonia))
+
+permutest(betadisper(species_betabray_resampled, ASPIRE_species_metadata$Pn_aetiology))
+TukeyHSD(betadisper(species_betabray_resampled, ASPIRE_species_metadata$Pn_aetiology))
+
+permutest(betadisper(species_betabray_resampled, ASPIRE_species_metadata$Region))
+TukeyHSD(betadisper(species_betabray_resampled, ASPIRE_species_metadata$Region))
+
+permutest(betadisper(species_betabray_resampled, ASPIRE_species_metadata$Dom))
+TukeyHSD(betadisper(species_betabray_resampled, ASPIRE_species_metadata$Dom))
+
+permutest(betadisper(species_betabray_resampled, ASPIRE_species_metadata$Tracheo))
+TukeyHSD(betadisper(species_betabray_resampled, ASPIRE_species_metadata$Tracheo))
+
+permutest(betadisper(species_betabray_resampled, ASPIRE_species_metadata$Ab_prev_adm))
+TukeyHSD(betadisper(species_betabray_resampled, ASPIRE_species_metadata$Ab_prev_adm))
+
+permutest(betadisper(species_betabray_resampled, ASPIRE_species_metadata$Ab_prev_sample))
+TukeyHSD(betadisper(species_betabray_resampled, ASPIRE_species_metadata$Ab_prev_sample))
+
+permutest(betadisper(species_betabray_resampled, ASPIRE_species_metadata$Antianaerobic))
+TukeyHSD(betadisper(species_betabray_resampled, ASPIRE_species_metadata$Antianaerobic))
+
+permutest(betadisper(species_betabray_resampled, ASPIRE_species_metadata$Colonization))
+TukeyHSD(betadisper(species_betabray_resampled, ASPIRE_species_metadata$Colonization))
+
+permutest(betadisper(species_betabray_resampled, ASPIRE_species_metadata$Gender))
+TukeyHSD(betadisper(species_betabray_resampled, ASPIRE_species_metadata$Gender))
+
+permutest(betadisper(species_betabray_resampled, ASPIRE_species_metadata$Origin))
+TukeyHSD(betadisper(species_betabray_resampled, ASPIRE_species_metadata$Origin))
+
+```
+
+```{r dbRDA}
+
+ASPIRE_species_reads_metadata_z <- ASPIRE_species_metadata
+ASPIRE_species_reads_metadata_z$BMI <- (ASPIRE_species_reads_metadata_z$BMI - mean(ASPIRE_species_reads_metadata_z$BMI))/sd(ASPIRE_species_reads_metadata_z$BMI)
+ASPIRE_species_reads_metadata_z$Age <- (ASPIRE_species_reads_metadata_z$Age - mean(ASPIRE_species_reads_metadata_z$Age))/sd(ASPIRE_species_reads_metadata_z$Age)
+ASPIRE_species_reads_metadata_z$apache_II_final <- (ASPIRE_species_reads_metadata_z$apache_II_final - mean(ASPIRE_species_reads_metadata_z$apache_II_final))/sd(ASPIRE_species_reads_metadata_z$apache_II_final)
+ASPIRE_species_reads_metadata_z$MV_days <- (ASPIRE_species_reads_metadata_z$MV_days - mean(ASPIRE_species_reads_metadata_z$MV_days))/sd(ASPIRE_species_reads_metadata_z$MV_days)
+
+dbRDA_full_species_resampled <- capscale(species_betabray_resampled ~ Region + Pneumonia + Colonization + Pn_aetiology + Dom + Ab_prev_adm + Ab_prev_sample + Antianaerobic + Gender + BMI + Age + apache_II_final + Tracheo + Origin + MV_days, ASPIRE_species_reads_metadata_z)
+vif.cca(dbRDA_full_species_resampled)
+anova(dbRDA_full_species_resampled, by = "terms")
+
+```
+
+```{r ANCOM}
+
+ancom2_pneumonia_region_nogroup = ancombc2(data = t(ASPIRE_species), meta_data = ASPIRE_species_metadata, fix_formula = "Pneumonia + Region")
+res2_nogroup = ancom2_pneumonia_region_nogroup$res
+
+ancom_figure <- ggplot(res2_nogroup[res2_nogroup$`diff_robust_RegionWestern Europe` == TRUE,], aes(x = `lfc_RegionWestern Europe`, y = reorder(taxon, -`lfc_RegionWestern Europe`))) +
+   geom_bar(stat = "identity", colour = "black", fill = ifelse(res2_nogroup[res2_nogroup$`diff_robust_RegionWestern Europe` == TRUE,]$`lfc_RegionWestern Europe` > 0, "blue", "red")) +
+   geom_errorbar(aes(xmin = `lfc_RegionWestern Europe` - `se_RegionWestern Europe`, xmax = `lfc_RegionWestern Europe` + `se_RegionWestern Europe`), width = 0.4, color = "black") +
+   geom_rect(data = data.frame(xmin = c(-Inf, 0), xmax = c(0, Inf), ymin = c(-Inf, -Inf), ymax = c(Inf, Inf), fill = c("purple", "orange")), aes(xmin = xmin, xmax = xmax, ymin = ymin, ymax = ymax, fill = fill), inherit.aes = FALSE, alpha = .2, show.legend = FALSE) +
+  scale_fill_manual(values = c("purple" = "purple", "orange" = "orange", guide = "none")) +
+  geom_vline(xintercept = 0) +
+  theme_bw() +
+  theme(legend.position = "bottom", text = element_text(size = 12, face = "bold")) +
+  labs(title = "Differentially abundant species in each region") +
+  xlab(label = "log2 fold change") +
+  ylab(label = NULL)
+ancom_figure
+
+```
+
+```{r plot species diversity per pneumonia yesno}
+
+data_summary <- function(data, varname, groupnames){
+  require(plyr)
+  summary_func <- function(x, col){
+    c(mean = mean(x[[col]], na.rm=TRUE),
+      sd = sd(x[[col]], na.rm=TRUE))
+  }
+  data_sum<-ddply(data, groupnames, .fun=summary_func,
+                  varname)
+  data_sum <- rename(data_sum, c("mean" = varname))
+ return(data_sum)
+}
+
+shannon_analysis_pn <- data_summary(ASPIRE_species_metadata, varname = "Shannon_species", groupnames = c("Pneumonia"))
+
+ASPIRE_species_dive_pnyn <- ggplot(ASPIRE_species_metadata, aes(x = Pneumonia, y = Shannon_species)) +
+   ylim(0,5.5) +
+   geom_jitter(position = position_jitterdodge(jitter.width = 0), data = shannon_analysis_pn, aes(color = Pneumonia, size = 1)) +
+   geom_point(position = position_jitterdodge(jitter.width = 0), aes(color = Pneumonia, alpha = 0.5), show.legend = FALSE) +
+   geom_errorbar(position = position_jitterdodge(jitter.width = 0), data = shannon_analysis_pn, aes(color = Pneumonia, ymin = Shannon_species+sd, ymax = Shannon_species+sd), width = 0.15, show.legend = FALSE) +
+   geom_linerange(position = position_jitterdodge(jitter.width = 0), data = shannon_analysis_pn, aes(color = Pneumonia, ymin = Shannon_species, ymax = Shannon_species+sd), show.legend = FALSE) +
+   scale_x_discrete(limits = c("No", "Yes")) +
+   scale_color_manual(values = c("#E69F00", "#56B4E9")) +
+   theme_bw() +
+   ylab("Shannon diversity index") +
+   xlab(NULL) +
+   guides(color = guide_legend(title = "Pneumonia", title.position = "top"), size = "none") +
+   labs(tag = "A") +
+   theme(text = element_text(size=16, face = "bold"), axis.ticks.x = element_blank(), axis.text.x = element_blank())
+
+ASPIRE_species_dive_pnyn
+
+```
+
+```{r plot RGPC per pneumonia yesno}
+
+data_summary <- function(data, varname, groupnames){
+  require(plyr)
+  summary_func <- function(x, col){
+    c(mean = mean(x[[col]], na.rm=TRUE),
+      sd = sd(x[[col]], na.rm=TRUE))
+  }
+  data_sum<-ddply(data, groupnames, .fun=summary_func,
+                  varname)
+  data_sum <- rename(data_sum, c("mean" = varname))
+ return(data_sum)
+}
+
+RGPC_analysis <- data_summary(ASPIRE_genus_metadata, varname = "RGPC", groupnames = c("Pneumonia"))
+
+ASPIRE_RGPC_pnyn <- ggplot(ASPIRE_genus_metadata, aes(x = Pneumonia, y = RGPC)) +
+   ylim(0,35) +
+   geom_jitter(position = position_jitterdodge(jitter.width = 0), data = RGPC_analysis, aes(color = Pneumonia, size = 1)) +
+   geom_point(position = position_jitterdodge(jitter.width = 0), aes(color = Pneumonia, alpha = 0.5), show.legend = FALSE) +
+   geom_errorbar(position = position_jitterdodge(jitter.width = 0), data = RGPC_analysis, aes(color = Pneumonia, ymin = RGPC+sd, ymax = RGPC+sd), width = 0.15, show.legend = FALSE) +
+   geom_linerange(position = position_jitterdodge(jitter.width = 0), data = RGPC_analysis, aes(color = Pneumonia, ymin = RGPC, ymax = RGPC+sd), show.legend = FALSE) +
+   # scale_x_discrete(limits = c("No", "Yes")) +
+   scale_color_manual(values = c("#E69F00", "#56B4E9")) +
+   theme_bw() +
+   ylab("RGPC") +
+   xlab(NULL) +
+   guides(color = guide_legend(title = "Pneumonia development", title.position = "top"), size = "none") +
+   labs(tag = "A") +
+   theme(text = element_text(size=16, face = "bold"), legend.position = "bottom", axis.ticks.x = element_blank(), axis.text.x = element_blank())
+
+ASPIRE_RGPC_pnyn
+
+```
+
+```{r plot species diversity per aetiology}
+
+data_summary <- function(data, varname, groupnames){
+  require(plyr)
+  summary_func <- function(x, col){
+    c(mean = mean(x[[col]], na.rm=TRUE),
+      sd = sd(x[[col]], na.rm=TRUE))
+  }
+  data_sum<-ddply(data, groupnames, .fun=summary_func,
+                  varname)
+  data_sum <- rename(data_sum, c("mean" = varname))
+ return(data_sum)
+}
+
+ASPIRE_species_metadata$Pn_aetiology <- factor(ASPIRE_species_metadata$Pn_aetiology, c("No pneumonia", "Acinetobacter pneumonia", "Enterobacteria pneumonia", "PA pneumonia", "PA mixed pneumonia", "SA pneumonia", "SA mixed pneumonia", "Other pneumonia", "Unknown pneumonia"))
+shannon_analysis_newdiag <- data_summary(ASPIRE_species_metadata, varname = "Shannon_species", groupnames = c("Pn_aetiology"))
+
+ASPIRE_species_dive_newdiag <- ggplot(ASPIRE_species_metadata, aes(x = Pn_aetiology, y = Shannon_species)) +
+   ylim(0,5.5) +
+   geom_jitter(position = position_jitterdodge(jitter.width = 0), data = shannon_analysis_newdiag, aes(color = Pn_aetiology, size = 1)) +
+   geom_point(position = position_jitterdodge(jitter.width = 0), aes(color = Pn_aetiology, alpha = 0.5), show.legend = FALSE) +
+   geom_errorbar(position = position_jitterdodge(jitter.width = 0), data = shannon_analysis_newdiag, aes(color = Pn_aetiology, ymin = Shannon_species+sd, ymax = Shannon_species+sd), width = 0.15, show.legend = FALSE) +
+   geom_linerange(position = position_jitterdodge(jitter.width = 0), data = shannon_analysis_newdiag, aes(color = Pn_aetiology, ymin = Shannon_species, ymax = Shannon_species+sd), show.legend = FALSE) +
+   # scale_x_discrete(limits = c("No", "Yes")) +
+   scale_color_manual(values = c("#E69F00", "#AA4499", "#009E73", "#CC79A7", "#F0E442", "#0072B2", "#D55E00", "#000000", "#332288")) +
+   theme_bw() +
+   ylab(NULL) +
+   xlab(NULL) +
+   guides(color = guide_legend(title = "Pneumonia aetiology based\n on local cultures", title.position = "top"), size = "none") +
+   labs(tag = "B") +
+   theme(text = element_text(size=16, face = "bold"), axis.ticks.x = element_blank(), axis.text.x = element_blank())
+
+ASPIRE_species_dive_newdiag
+
+```
+
+```{r plot species diversity per dominant}
+
+data_summary <- function(data, varname, groupnames){
+  require(plyr)
+  summary_func <- function(x, col){
+    c(mean = mean(x[[col]], na.rm=TRUE),
+      sd = sd(x[[col]], na.rm=TRUE))
+  }
+  data_sum<-ddply(data, groupnames, .fun=summary_func,
+                  varname)
+  data_sum <- rename(data_sum, c("mean" = varname))
+ return(data_sum)
+}
+
+shannon_analysis_dom <- data_summary(ASPIRE_species_metadata, varname = "Shannon_species", groupnames = c("Dom"))
+
+ASPIRE_species_dive_dom <- ggplot(ASPIRE_species_metadata, aes(x = Dom, y = Shannon_species)) +
+   ylim(0,5.5) +
+   geom_jitter(position = position_jitterdodge(jitter.width = 0), data = shannon_analysis_dom, aes(color = Dom, size = 1)) +
+   geom_point(position = position_jitterdodge(jitter.width = 0), aes(color = Dom, alpha = 0.5), show.legend = FALSE) +
+   geom_errorbar(position = position_jitterdodge(jitter.width = 0), data = shannon_analysis_dom, aes(color = Dom, ymin = Shannon_species+sd, ymax = Shannon_species+sd), width = 0.15, show.legend = FALSE) +
+   geom_linerange(position = position_jitterdodge(jitter.width = 0), data = shannon_analysis_dom, aes(color = Dom, ymin = Shannon_species, ymax = Shannon_species+sd), show.legend = FALSE) +
+   # scale_x_discrete(limits = c("No", "Yes")) +
+   scale_color_manual(values = c("#E69F00", "#56B4E9", "#009E73", "#CC79A7", "#F0E442", "#0072B2", "#D55E00", "#000000", "#332288", "#AA4499", "#FF0000", "#00FF00", "#0000FF", "#FF00FF")) +
+   theme_bw() +
+   ylab("Shannon diversity index") +
+   xlab(NULL) +
+   guides(color = guide_legend(title = "Dominant genus", title.position = "top", label.theme = element_text(face = "bold.italic")), size = "none") +
+   labs(tag = "C") +
+   theme(text = element_text(size=16 , face = "bold"), axis.ticks.x = element_blank(), axis.text.x = element_blank())
+
+ASPIRE_species_dive_dom
+
+```
+
+```{r plot species diversity per region}
+
+data_summary <- function(data, varname, groupnames){
+  require(plyr)
+  summary_func <- function(x, col){
+    c(mean = mean(x[[col]], na.rm=TRUE),
+      sd = sd(x[[col]], na.rm=TRUE))
+  }
+  data_sum<-ddply(data, groupnames, .fun=summary_func,
+                  varname)
+  data_sum <- rename(data_sum, c("mean" = varname))
+ return(data_sum)
+}
+
+shannon_analysis <- data_summary(ASPIRE_species_metadata, varname = "Shannon_species", groupnames = c("Region"))
+
+ASPIRE_species_dive_region <- ggplot(ASPIRE_species_metadata, aes(x = Region, y = Shannon_species)) +
+   ylim(0,5.5) +
+   geom_jitter(position = position_jitterdodge(jitter.width = 0), data = shannon_analysis, aes(color = Region, size = 1)) +
+   geom_point(position = position_jitterdodge(jitter.width = 0), aes(color = Region, alpha = 0.5), show.legend = FALSE) +
+   geom_errorbar(position = position_jitterdodge(jitter.width = 0), data = shannon_analysis, aes(color = Region, ymin = Shannon_species+sd, ymax = Shannon_species+sd), width = 0.15, show.legend = FALSE) +
+   geom_linerange(position = position_jitterdodge(jitter.width = 0), data = shannon_analysis, aes(color = Region, ymin = Shannon_species, ymax = Shannon_species+sd), show.legend = FALSE) +
+   scale_color_manual(values = c("#009E73", "#CC79A7")) +
+   theme_bw() +
+   ylab(NULL) +
+   xlab(NULL) +
+   labs(tag = "D") +
+   guides(color = guide_legend(title = "Geographic region", title.position = "top"), size = "none") +
+   theme(text = element_text(size=16 , face = "bold"), axis.ticks.x = element_blank(), axis.text.x = element_blank())
+
+ASPIRE_species_dive_region
+
+```
+
+```{r plot RGPC per region}
+
+data_summary <- function(data, varname, groupnames){
+  require(plyr)
+  summary_func <- function(x, col){
+    c(mean = mean(x[[col]], na.rm=TRUE),
+      sd = sd(x[[col]], na.rm=TRUE))
+  }
+  data_sum<-ddply(data, groupnames, .fun=summary_func,
+                  varname)
+  data_sum <- rename(data_sum, c("mean" = varname))
+ return(data_sum)
+}
+
+RGPC_analysis <- data_summary(ASPIRE_genus_metadata, varname = "RGPC", groupnames = c("Region"))
+
+ASPIRE_RGPC_region <- ggplot(ASPIRE_genus_metadata, aes(x = Region, y = RGPC)) +
+   ylim(0,35) +
+   geom_jitter(position = position_jitterdodge(jitter.width = 0), data = RGPC_analysis, aes(color = Region, size = 1)) +
+   geom_point(position = position_jitterdodge(jitter.width = 0), aes(color = Region, alpha = 0.5), show.legend = FALSE) +
+   geom_errorbar(position = position_jitterdodge(jitter.width = 0), data = RGPC_analysis, aes(color = Region, ymin = RGPC+sd, ymax = RGPC+sd), width = 0.15, show.legend = FALSE) +
+   geom_linerange(position = position_jitterdodge(jitter.width = 0), data = RGPC_analysis, aes(color = Region, ymin = RGPC, ymax = RGPC+sd), show.legend = FALSE) +
+   scale_x_discrete(labels = NULL) +
+   scale_color_manual(values = c("#009E73", "#CC79A7")) +
+   theme_bw() +
+   ylab("RGPC") +
+   xlab(NULL) +
+   labs(tag = "C") +
+   guides(color = guide_legend(title = "Geographic region", title.position = "top"), size = "none") +
+   theme(text = element_text(size=16 , face = "bold"), legend.position =  "bottom", axis.ticks.x = element_blank(), axis.text.x = element_blank())
+
+ASPIRE_RGPC_region
+
+```
+
+```{r plot RGPC per ABpreIC}
+
+data_summary <- function(data, varname, groupnames){
+  require(plyr)
+  summary_func <- function(x, col){
+    c(mean = mean(x[[col]], na.rm=TRUE),
+      sd = sd(x[[col]], na.rm=TRUE))
+  }
+  data_sum<-ddply(data, groupnames, .fun=summary_func,
+                  varname)
+  data_sum <- rename(data_sum, c("mean" = varname))
+ return(data_sum)
+}
+
+RGPC_analysis <- data_summary(ASPIRE_genus_metadata, varname = "RGPC", groupnames = c("Ab_prev_adm"))
+
+ASPIRE_RGPC_abpreadm <- ggplot(ASPIRE_genus_metadata, aes(x = Ab_prev_adm, y = RGPC)) +
+   ylim(0,35) +
+   geom_jitter(position = position_jitterdodge(jitter.width = 0), data = RGPC_analysis, aes(color = Ab_prev_adm, size = 1)) +
+   geom_point(position = position_jitterdodge(jitter.width = 0), aes(color = Ab_prev_adm, alpha = 0.5), show.legend = FALSE) +
+   geom_errorbar(position = position_jitterdodge(jitter.width = 0), data = RGPC_analysis, aes(color = Ab_prev_adm, ymin = RGPC+sd, ymax = RGPC+sd), width = 0.15, show.legend = FALSE) +
+   geom_linerange(position = position_jitterdodge(jitter.width = 0), data = RGPC_analysis, aes(color = Ab_prev_adm, ymin = RGPC, ymax = RGPC+sd), show.legend = FALSE) +
+   scale_x_discrete(limits = c("No", "Yes", "unk")) +
+   scale_color_manual(values = c("#E69F00", "#56B4E9", "#CC79A7"), labels = c("No", "Unknown", "Yes")) +
+   theme_bw() +
+   ylab(NULL) +
+   xlab(NULL) +
+   guides(color = guide_legend(title = "Antibiotics received prior to admission", title.position = "top"), size = "none") +
+   labs(tag = "B") +
+   theme(text = element_text(size=16, face = "bold"), legend.position = "bottom", axis.ticks.x = element_blank(), axis.text.x = element_blank())
+
+ASPIRE_RGPC_abpreadm
+
+```
+
+```{r plot RGPC per ABpresample}
+
+data_summary <- function(data, varname, groupnames){
+  require(plyr)
+  summary_func <- function(x, col){
+    c(mean = mean(x[[col]], na.rm=TRUE),
+      sd = sd(x[[col]], na.rm=TRUE))
+  }
+  data_sum<-ddply(data, groupnames, .fun=summary_func,
+                  varname)
+  data_sum <- rename(data_sum, c("mean" = varname))
+ return(data_sum)
+}
+
+RGPC_analysis <- data_summary(ASPIRE_genus_metadata, varname = "RGPC", groupnames = c("Ab_prev_sample"))
+
+ASPIRE_RGPC_abpresample <- ggplot(ASPIRE_genus_metadata, aes(x = Ab_prev_sample, y = RGPC)) +
+   ylim(0,35) +
+   geom_jitter(position = position_jitterdodge(jitter.width = 0), data = RGPC_analysis, aes(color = Ab_prev_sample, size = 1)) +
+   geom_point(position = position_jitterdodge(jitter.width = 0), aes(color = Ab_prev_sample, alpha = 0.5), show.legend = FALSE) +
+   geom_errorbar(position = position_jitterdodge(jitter.width = 0), data = RGPC_analysis, aes(color = Ab_prev_sample, ymin = RGPC+sd, ymax = RGPC+sd), width = 0.15, show.legend = FALSE) +
+   geom_linerange(position = position_jitterdodge(jitter.width = 0), data = RGPC_analysis, aes(color = Ab_prev_sample, ymin = RGPC, ymax = RGPC+sd), show.legend = FALSE) +
+   scale_x_discrete(limits = c("No", "Yes")) +
+   scale_color_manual(values = c("#E69F00", "#CC79A7")) +
+   theme_bw() +
+   ylab(NULL) +
+   xlab(NULL) +
+   guides(color = guide_legend(title = "Antibiotics received before sampling", title.position = "top"), size = "none") +
+   labs(tag = "D") +
+   theme(text = element_text(size=16, face = "bold"), legend.position = "bottom", axis.ticks.x = element_blank(), axis.text.x = element_blank())
+
+ASPIRE_RGPC_abpresample
+
+```
+
+```{r plot RGPC per Antianaerobic}
+
+data_summary <- function(data, varname, groupnames){
+  require(plyr)
+  summary_func <- function(x, col){
+    c(mean = mean(x[[col]], na.rm=TRUE),
+      sd = sd(x[[col]], na.rm=TRUE))
+  }
+  data_sum<-ddply(data, groupnames, .fun=summary_func,
+                  varname)
+  data_sum <- rename(data_sum, c("mean" = varname))
+ return(data_sum)
+}
+
+RGPC_analysis <- data_summary(ASPIRE_genus_metadata, varname = "RGPC", groupnames = c("Antianaerobic"))
+
+ASPIRE_RGPC_antianaerobic <- ggplot(ASPIRE_genus_metadata, aes(x = Antianaerobic, y = RGPC)) +
+   ylim(0,35) +
+   geom_jitter(position = position_jitterdodge(jitter.width = 0), data = RGPC_analysis, aes(color = Antianaerobic, size = 1)) +
+   geom_point(position = position_jitterdodge(jitter.width = 0), aes(color = Antianaerobic, alpha = 0.5), show.legend = FALSE) +
+   geom_errorbar(position = position_jitterdodge(jitter.width = 0), data = RGPC_analysis, aes(color = Antianaerobic, ymin = RGPC+sd, ymax = RGPC+sd), width = 0.15, show.legend = FALSE) +
+   geom_linerange(position = position_jitterdodge(jitter.width = 0), data = RGPC_analysis, aes(color = Antianaerobic, ymin = RGPC, ymax = RGPC+sd), show.legend = FALSE) +
+   scale_x_discrete(limits = c("No", "Yes")) +
+   scale_color_manual(values = c("#E69F00", "#CC79A7")) +
+   theme_bw() +
+   ylab(NULL) +
+   xlab(NULL) +
+   guides(color = guide_legend(title = "Exposure to antianaerobic antibiotics", title.position = "top"), size = "none") +
+   labs(tag = "D") +
+   theme(text = element_text(size=16, face = "bold"), legend.position = "bottom", axis.ticks.x = element_blank(), axis.text.x = element_blank())
+
+ASPIRE_RGPC_antianaerobic
+
+```
